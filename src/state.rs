@@ -294,3 +294,402 @@ impl DkgState {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bls::rand::{rngs::StdRng, seq::IteratorRandom, thread_rng, SeedableRng};
+    use proptest::prelude::*;
+
+    #[test]
+    fn gg() -> Result<()> {
+        let num_nodes = 7;
+        let threshold = 4;
+        let seed = 123;
+        let mut rng = StdRng::seed_from_u64(seed);
+
+        let mut nodes = generate_nodes(num_nodes, threshold, &mut rng)?;
+        let mut parts: BTreeMap<usize, DkgSignedVote> = BTreeMap::new();
+        let mut acks: BTreeMap<usize, DkgSignedVote> = BTreeMap::new();
+        let mut all_acks: BTreeMap<usize, DkgSignedVote> = BTreeMap::new();
+        let mut sk_shares: BTreeMap<usize, SecretKeyShare> = BTreeMap::new();
+
+        for node in nodes.iter_mut() {
+            parts.insert(node.id() as usize, node.first_vote()?);
+        }
+
+        // for cmd in set_of_cmds(num_nodes, 123) {
+        //     match cmd {
+        //         Cmds::SendParts(from_node, to_nodes) => {
+        //             for (to, expt_resp) in to_nodes {
+        //                 let actual_resp = (&mut nodes[to])
+        //                     .handle_signed_vote(parts[&from_node].clone(), &mut rng)?;
+        //                 expt_resp.match_resp(actual_resp, to_update_aux, to_update_sk, id)
+        //             }
+        //         }
+        //         _ => {}
+        //     }
+        // }
+        Ok(())
+    }
+
+    // should be (Cmds, expected result when executed);  add a probablity to include nodes that been sent the part/acks/all
+    fn set_of_cmds(num_nodes: usize, seed: u64) -> Vec<Cmds> {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut nodes = Node::new(num_nodes);
+        // these nodes are required to help other nodes terminate
+        let mut active_nodes = Node::active_nodes(&nodes);
+        let mut commands = Vec::new();
+
+        while !active_nodes.is_empty() {
+            // get a random active node
+            let current_node = active_nodes[rng.gen::<usize>() % active_nodes.len()];
+
+            // check if current_node can send part/acks/all_acks; if so randomly choose between 1 of the action
+            let parts = nodes[current_node].can_send_parts(&nodes);
+            let acks = nodes[current_node].can_send_acks(&nodes);
+            let all_acks = nodes[current_node].can_send_all_acks(&nodes);
+
+            // continue if current_node cant progress
+            if parts.is_empty() && acks.is_empty() && all_acks.is_empty() {
+                continue;
+            }
+
+            let mut done = false;
+            while !done {
+                // randomly send out part/acks/all_acks
+                match rng.gen::<usize>() % 3 {
+                    0 if !parts.is_empty() => {
+                        let to_nodes = Node::sample_nodes(&parts, &mut rng);
+
+                        // update each `to` node and get its (id, response)
+                        let to_nodes_resp = to_nodes
+                            .into_iter()
+                            .map(|to| {
+                                let resp =
+                                    match (&mut nodes[to]).handled_parts.insert(current_node, true)
+                                    {
+                                        // updating the `to` with new info node can change its state
+                                        None => {
+                                            // if `to` node has handled all parts, it should receive a broadcast vote resp
+                                            if nodes[to].parts_done() {
+                                                MockVoteResponse::BroadcastVote
+                                            } else {
+                                                MockVoteResponse::WaitingForMoreVotes
+                                            }
+                                        }
+                                        Some(val) => {
+                                            // if true, we have already seen it
+                                            if val {
+                                                MockVoteResponse::IgnoringKnownVote
+                                            } else {
+                                                MockVoteResponse::WaitingForMoreVotes
+                                            }
+                                        }
+                                    };
+
+                                (to, resp)
+                            })
+                            .collect();
+
+                        commands.push(Cmds::SendParts(current_node, to_nodes_resp));
+                        done = true;
+                    }
+                    1 if !acks.is_empty() => {
+                        let to_nodes = Node::sample_nodes(&acks, &mut rng);
+
+                        let to_nodes_resp = to_nodes
+                            .into_iter()
+                            .map(|to| {
+                                let mut resp = match (&mut nodes[to])
+                                    .handled_acks
+                                    .insert(current_node, true)
+                                {
+                                    None => {
+                                        if nodes[to].acks_done() {
+                                            MockVoteResponse::BroadcastVote
+                                        } else {
+                                            MockVoteResponse::WaitingForMoreVotes
+                                        }
+                                    }
+                                    Some(val) => {
+                                        // if true, we have already seen it
+                                        if val {
+                                            MockVoteResponse::IgnoringKnownVote
+                                        } else {
+                                            MockVoteResponse::WaitingForMoreVotes
+                                        }
+                                    }
+                                };
+                                (to, resp)
+                            })
+                            .collect();
+
+                        commands.push(Cmds::SendAcks(current_node, to_nodes_resp));
+                        done = true;
+                    }
+                    2 if !all_acks.is_empty() => {
+                        let to_nodes = Node::sample_nodes(&all_acks, &mut rng);
+
+                        let to_nodes_resp = to_nodes
+                            .into_iter()
+                            .map(|to| {
+                                let resp = match (&mut nodes[to])
+                                    .handled_all_acks
+                                    .insert(current_node, true)
+                                {
+                                    None => {
+                                        if nodes[to].all_acks_done() {
+                                            MockVoteResponse::DkgComplete
+                                        } else {
+                                            MockVoteResponse::WaitingForMoreVotes
+                                        }
+                                    }
+                                    Some(val) => {
+                                        // if true, we have already seen it
+                                        if val {
+                                            MockVoteResponse::IgnoringKnownVote
+                                        } else {
+                                            MockVoteResponse::WaitingForMoreVotes
+                                        }
+                                    }
+                                };
+                                (to, resp)
+                            })
+                            .collect();
+
+                        commands.push(Cmds::SendAllAcks(current_node, to_nodes_resp));
+                        done = true;
+                    }
+                    _ => {}
+                }
+            }
+            active_nodes = Node::active_nodes(&nodes);
+        }
+        commands
+    }
+
+    // Test helpers
+    fn generate_nodes<R: RngCore>(
+        num_nodes: usize,
+        threshold: usize,
+        mut rng: &mut R,
+    ) -> Result<Vec<DkgState>> {
+        let secret_keys: Vec<SecretKey> = (0..num_nodes).map(|_| bls::rand::random()).collect();
+        let pub_keys: BTreeMap<_, _> = secret_keys
+            .iter()
+            .enumerate()
+            .map(|(id, sk)| (id as u8, sk.public_key()))
+            .collect();
+        secret_keys
+            .iter()
+            .enumerate()
+            .map(|(id, sk)| {
+                DkgState::new(id as u8, sk.clone(), pub_keys.clone(), threshold, &mut rng)
+            })
+            .collect()
+    }
+
+    #[derive(Debug)]
+    enum Cmds {
+        // from, to
+        SendParts(usize, Vec<(usize, MockVoteResponse)>),
+        SendAcks(usize, Vec<(usize, MockVoteResponse)>),
+        SendAllAcks(usize, Vec<(usize, MockVoteResponse)>),
+    }
+
+    #[derive(Debug)]
+    enum MockVoteResponse {
+        WaitingForMoreVotes,
+        IgnoringKnownVote,
+        BroadcastVote,
+        RequestAntiEntropy,
+        DkgComplete,
+    }
+
+    impl MockVoteResponse {
+        pub fn match_resp(
+            &self,
+            actual_resp: VoteResponse,
+            update_votes: Option<&mut BTreeMap<usize, DkgSignedVote>>,
+            to_update_sk: Option<&mut BTreeMap<usize, SecretKeyShare>>,
+            id: usize,
+        ) -> bool {
+            if matches!(self, Self::WaitingForMoreVotes)
+                && matches!(actual_resp, VoteResponse::WaitingForMoreVotes)
+            {
+                return true;
+            } else if matches!(self, Self::IgnoringKnownVote)
+                && matches!(actual_resp, VoteResponse::IgnoringKnownVote)
+            {
+                return true;
+            } else if matches!(self, Self::BroadcastVote) {
+                if let VoteResponse::BroadcastVote(vote) = actual_resp {
+                    if let Some(to_update) = update_votes {
+                        to_update.insert(id, *vote);
+                    } else {
+                        println!("pass in map to update part/acks/all_acks");
+                        return false;
+                    }
+                    return true;
+                } else {
+                    return false;
+                }
+            } else if matches!(self, Self::BroadcastVote) {
+                if let VoteResponse::DkgComplete(_, sk) = actual_resp {
+                    if let Some(to_update) = to_update_sk {
+                        to_update.insert(id, sk);
+                    } else {
+                        println!("pass in map to update sk_share");
+                        return false;
+                    }
+                    return true;
+                } else {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct Node {
+        id: usize,
+        // Has the current node handled parts, acks, all_acks from another node? whom we have handled
+        // randomly handle current node's part/all
+        handled_parts: BTreeMap<usize, bool>,
+        handled_acks: BTreeMap<usize, bool>,
+        handled_all_acks: BTreeMap<usize, bool>,
+    }
+
+    impl Node {
+        pub fn new(num_nodes: usize) -> Vec<Node> {
+            let mut status: BTreeMap<usize, bool> = BTreeMap::new();
+            (0..num_nodes).for_each(|id| {
+                let _ = status.insert(id, false);
+            });
+            (0..num_nodes)
+                .map(|id| {
+                    // we have handled our parts/acks/all_acks by default
+                    let mut our_status = status.clone();
+                    our_status.insert(id, true);
+                    Node {
+                        id,
+                        handled_parts: our_status.clone(),
+                        handled_acks: our_status.clone(),
+                        handled_all_acks: our_status,
+                    }
+                })
+                .collect()
+        }
+
+        // return the node id's that have not handled self's part
+        pub fn can_send_parts(&self, nodes: &Vec<Node>) -> Vec<usize> {
+            nodes
+                .iter()
+                .filter_map(|node| {
+                    // if node has not handled self's part
+                    if !node.handled_parts[&self.id] {
+                        Some(node.id)
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        }
+
+        pub fn can_send_acks(&self, nodes: &Vec<Node>) -> Vec<usize> {
+            // if self has not handled the parts from other nodes, then it cant produce an ack
+            // the other node should not have handled self's ack
+            if !self.parts_done() {
+                return Vec::new();
+            }
+            nodes
+                .iter()
+                .filter_map(|node| {
+                    if !node.handled_acks[&self.id] {
+                        Some(node.id)
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        }
+
+        pub fn can_send_all_acks(&self, nodes: &Vec<Node>) -> Vec<usize> {
+            // self should've handled all the acks (except self's)
+            // the other node should not have handled self's all_ack
+            if !self.acks_done() {
+                return Vec::new();
+            }
+            nodes
+                .iter()
+                .filter_map(|node| {
+                    if !node.handled_all_acks[&self.id] {
+                        Some(node.id)
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        }
+
+        // returns true if self has recieved/handled all the parts (except itself)
+        pub fn parts_done(&self) -> bool {
+            self.handled_parts
+                .iter()
+                .filter(|(&id, _)| id != self.id)
+                .all(|(_, &val)| val)
+        }
+
+        pub fn acks_done(&self) -> bool {
+            self.handled_acks
+                .iter()
+                .filter(|(&id, _)| id != self.id)
+                .all(|(_, &val)| val)
+        }
+
+        pub fn all_acks_done(&self) -> bool {
+            // check if current_node has completed the dkg round; i.e., it has handled all_acks from all other nodes
+            self.handled_all_acks
+                .iter()
+                .filter(|(&id, _)| id != self.id)
+                .all(|(_, &val)| val)
+        }
+
+        pub fn active_nodes(nodes: &Vec<Node>) -> Vec<usize> {
+            // a node is active, if any of the other node still requires votes from the current node
+            // filter out current node as we don't necessarily have to deal with our votes to move forward
+            let mut active_nodes = BTreeSet::new();
+            nodes.iter().for_each(|node| {
+                // check parts
+                node.handled_parts.iter().for_each(|(&id, &val)| {
+                    // if current node has not handled a part from another node (i.e. false), we need the other node
+                    if id != node.id && !val {
+                        active_nodes.insert(id);
+                    };
+                });
+
+                node.handled_acks.iter().for_each(|(&id, &val)| {
+                    if id != node.id && !val {
+                        active_nodes.insert(id);
+                    };
+                });
+
+                node.handled_all_acks.iter().for_each(|(&id, &val)| {
+                    if id != node.id && !val {
+                        active_nodes.insert(id);
+                    };
+                });
+            });
+            active_nodes.into_iter().collect()
+        }
+
+        // select a subset of node i's from the given list
+        pub fn sample_nodes<R: RngCore>(nodes: &Vec<usize>, rng: &mut R) -> Vec<usize> {
+            let sample_n_nodes = (rng.gen::<usize>() % nodes.len()) + 1;
+            nodes.iter().cloned().choose_multiple(rng, sample_n_nodes)
+        }
+    }
+}

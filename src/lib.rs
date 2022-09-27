@@ -22,7 +22,7 @@ pub use vote::DkgVote;
 
 // Test of sn_sdkg with explanations and usage example
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use bls::{PublicKey, SecretKey, SignatureShare};
     use std::collections::BTreeMap;
