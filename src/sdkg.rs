@@ -643,6 +643,11 @@ pub(crate) mod tests {
         }
         Ok(())
     }
+    #[test]
+    fn failure_case() -> Result<()> {
+        simulate_dkg_round(5, 2)?;
+        Ok(())
+    }
 
     // Test helpers
     #[allow(clippy::type_complexity)]
@@ -720,6 +725,18 @@ pub(crate) mod tests {
             pk_set.insert(pks);
             secret_key_shares.push((id, sks));
         }
+
+        let secrets: BTreeMap<_, _> = secret_key_shares
+            .iter()
+            .map(|(idx, share)| {
+                println!("{idx}, {:?}", share.reveal());
+                let bytes = share.to_bytes();
+                // cannot be mapped to Err
+                let fr = bls::blstrs::Scalar::from_bytes_be(&bytes).unwrap();
+                (idx + 1, fr)
+            })
+            .collect();
+        let _sk_set = bls::SecretKeySet::from(bls::poly::Poly::interpolate(secrets)?);
 
         // verify that they produced a single pks
         if pk_set.len() != 1 {
